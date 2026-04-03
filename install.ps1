@@ -446,19 +446,30 @@ foreach ($loc in @(
     }
 }
 
-# Rename claude.exe so .cmd takes precedence
-# (rename works even if the exe is running; delete does not)
+# Clean up leftover timestamped/old exes from previous installs
+Get-ChildItem $BinDir -Filter "claude.*.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "claude.orig.exe" } |
+    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+
+# Remove claude.exe so .cmd takes precedence
+# Keep one backup as claude.orig.exe, discard the rest
 if (Test-Path $claudeExe) {
     if (-not (Test-Path $claudeOrigExe)) {
         Rename-Item $claudeExe $claudeOrigExe -Force
         Write-OK "Renamed claude.exe → claude.orig.exe"
     } else {
-        # Backup already exists, rename to .old for cleanup
-        $oldExe = Join-Path $BinDir "claude.old.exe"
-        Rename-Item $claudeExe $oldExe -Force -ErrorAction SilentlyContinue
-        Write-OK "Moved claude.exe aside (.cmd now takes priority)"
+        # Backup already exists — just remove the new claude.exe
+        try {
+            Remove-Item -Force $claudeExe
+        } catch {
+            # File locked (running process) — rename aside with timestamp
+            $ts = Get-Date -Format "yyyyMMddHHmmss"
+            Rename-Item $claudeExe "claude.$ts.exe" -Force -ErrorAction SilentlyContinue
+        }
+        Write-OK "Removed claude.exe (.cmd now takes priority)"
     }
 }
+
 
 # Write .cmd launcher for 'claude'
 foreach ($cmd in @("claude")) {
