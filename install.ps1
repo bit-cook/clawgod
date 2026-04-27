@@ -51,8 +51,14 @@ if ($Uninstall) {
         Move-Item -Force $claudeExeOrig $claudeExe
         Write-OK "Original claude.exe restored"
     }
+    # Remove explicit clawgod alias
+    $clawgodCmd = Join-Path $BinDir "clawgod.cmd"
+    if (Test-Path $clawgodCmd) {
+        Remove-Item -Force $clawgodCmd
+        Write-OK "Removed clawgod alias"
+    }
 
-    foreach ($f in @("cli.js","cli.original.js","cli.original.js.bak","patch.js","node_modules")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
     }
@@ -65,7 +71,7 @@ if ($Uninstall) {
 
 try { $null = Get-Command node -ErrorAction Stop }
 catch {
-    Write-Err "Node.js is required (>= 18). Install from https://nodejs.org"
+    Write-Err "Node.js is required (>= 18) for the patcher. Install from https://nodejs.org"
     exit 1
 }
 
@@ -75,55 +81,50 @@ if ($nodeVer -lt 18) {
     exit 1
 }
 
-try { $null = Get-Command npm -ErrorAction Stop }
+# ─── Ensure Bun (runtime that executes the patched cli.js) ────────────
+
+$BunBin = $null
+try { $BunBin = (Get-Command bun -ErrorAction Stop).Source } catch {}
+if (-not $BunBin) {
+    $homeBun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
+    if (Test-Path $homeBun) { $BunBin = $homeBun }
+}
+if (-not $BunBin) {
+    Write-Dim "Installing Bun (required runtime for v2.1.113+ cli.js) ..."
+    try {
+        Invoke-Expression "$(Invoke-RestMethod https://bun.sh/install.ps1)" 2>$null | Out-Null
+    } catch {}
+    $BunBin = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
+    if (-not (Test-Path $BunBin)) {
+        Write-Err "Bun installation failed. Install manually: https://bun.sh/install"
+        exit 1
+    }
+}
+Write-OK "Bun: $(& $BunBin --version)"
+
+# ─── ripgrep prerequisite (search/grep tool) ──────────────────────────
+# Hard prerequisite — without rg the Grep tool inside Claude Code fails.
+
+try {
+    $rgPath = (Get-Command rg -ErrorAction Stop).Source
+    Write-OK "ripgrep: $rgPath"
+}
 catch {
-    Write-Err "npm is required"
+    Write-Err "ripgrep (rg) is required but not found in PATH."
+    Write-Err "  Claude Code's Grep tool will not function without it."
+    Write-Err ""
+    Write-Err "  Install: winget install BurntSushi.ripgrep.MSVC"
+    Write-Err "       or: scoop install ripgrep"
+    Write-Err "       or: choco install ripgrep"
+    Write-Err ""
+    Write-Err "  Re-run this script after installing rg."
     exit 1
 }
 
-# ─── Install Claude Code from npm ─────────────────────
+# ─── Locate native Bun binary (must be present — cli.js source) ───────
 
 New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BinDir  | Out-Null
-
-Write-Dim "Installing @anthropic-ai/claude-code@$Version ..."
-npm install --prefix $ClawDir "@anthropic-ai/claude-code@$Version" --save-exact --no-fund --no-audit 2>$null | Out-Null
-$installedVer = node -e "console.log(require('$($ClawDir -replace '\\','/')/node_modules/@anthropic-ai/claude-code/package.json').version)"
-Write-OK "Claude Code v$installedVer downloaded"
-
-# ─── Copy bundle ──────────────────────────────────────
-
-$srcCli = Join-Path $ClawDir "node_modules\@anthropic-ai\claude-code\cli.js"
-$dstCli = Join-Path $ClawDir "cli.original.js"
-Copy-Item -Force $srcCli $dstCli
-Write-OK "Bundle extracted (cli.original.js)"
-
-# ─── Ensure ESM support ───────────────────────────────
-
-$pkgJson = Join-Path $ClawDir "package.json"
-$pkg = Get-Content $pkgJson -Raw | ConvertFrom-Json
-if (-not $pkg.type) {
-    $pkg | Add-Member -NotePropertyName "type" -NotePropertyValue "module" -Force
-    $pkg | ConvertTo-Json -Depth 10 | Set-Content $pkgJson -Encoding UTF8
-}
-
-# ─── Setup vendor directory ───────────────────────────
-
-$NpmVendor = Join-Path $ClawDir "node_modules\@anthropic-ai\claude-code\vendor"
-$VendorDir = Join-Path $ClawDir "vendor"
-
-if (Test-Path $VendorDir) { Remove-Item -Recurse -Force $VendorDir }
-New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
-
-if (Test-Path $NpmVendor) {
-    Copy-Item -Recurse -Force "$NpmVendor\*" $VendorDir -ErrorAction SilentlyContinue
-    Write-OK "Vendor copied from npm bundle (ripgrep, tree-sitter)"
-}
-
-# ─── Extract native modules from Bun binary ───────────
-# The official Claude Code binary has audio-capture/image-processor/
-# url-handler modules embedded. Extract them so Voice Mode works.
-# (Computer Use is macOS-only, no native modules on Windows)
 
 $NativeBin = $null
 $searchPaths = @(
@@ -152,11 +153,17 @@ if (-not $NativeBin) {
     }
 }
 
-if ($NativeBin) {
-    Write-Dim "Extracting native modules from $(Split-Path $NativeBin -Leaf) ..."
+if (-not $NativeBin) {
+    Write-Err "Native Claude Code binary not found"
+    Write-Err "Install the official binary first:"
+    Write-Err "  irm https://claude.ai/install.ps1 | iex"
+    Write-Err "Then re-run this script."
+    exit 1
+}
 
-    $extractorPath = Join-Path $ClawDir "extract-natives.mjs"
-    @'
+# Always write the extractor (used for cli.js and/or .node modules)
+$extractorPath = Join-Path $ClawDir "extract-natives.mjs"
+@'
 #!/usr/bin/env node
 /**
  * ClawGod native module extractor
@@ -451,11 +458,31 @@ function identifyDylib(buf, dylib) {
   return null;
 }
 
+// ─── cli.js text extraction (Bun standalone) ─────────────────────────
+
+const CLI_PATH_MARKER = Buffer.from('file:///$bunfs/root/src/entrypoints/cli.js');
+const CLI_FN_MARKER = Buffer.from('(function(exports, require, module');
+const CLI_TAIL_MARKER = Buffer.from('cli_after_main_complete")}');
+const CLI_END_MARKER = Buffer.from(');})');
+
+function extractCliJs(buf) {
+  const pathOff = buf.indexOf(CLI_PATH_MARKER);
+  if (pathOff === -1) return null;
+  const fnStart = buf.indexOf(CLI_FN_MARKER, pathOff);
+  if (fnStart === -1 || fnStart - pathOff > 1024) return null;
+  const tailMark = buf.indexOf(CLI_TAIL_MARKER, fnStart);
+  if (tailMark === -1) return null;
+  const ending = buf.indexOf(CLI_END_MARKER, tailMark);
+  if (ending === -1 || ending - tailMark > 4096) return null;
+  return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
+}
+
 function main() {
-  const [, , binaryPath, outputDir] = process.argv;
+  const [, , binaryPath, outputDir, ...rest] = process.argv;
+  const wantCliJs = rest.includes('--cli-js');
 
   if (!binaryPath || !outputDir) {
-    console.error('Usage: extract-natives.mjs <binary-path> <output-dir>');
+    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js]');
     process.exit(1);
   }
 
@@ -480,6 +507,19 @@ function main() {
 
   console.log(`Format:  ${format}`);
   console.log(`Size:    ${(buf.length / 1024 / 1024).toFixed(1)} MB`);
+
+  if (wantCliJs) {
+    const js = extractCliJs(buf);
+    if (!js) {
+      console.error('Could not locate cli.js payload in binary (markers missing).');
+      process.exit(2);
+    }
+    mkdirSync(outputDir, { recursive: true });
+    const out = join(outputDir, 'cli.original.js');
+    writeFileSync(out, js);
+    console.log(`  cli.js  ${(js.length / 1024 / 1024).toFixed(2)} MB -> ${out}`);
+    return;
+  }
 
   let libs = [];
   if (format === 'macho') libs = extractMachODylibs(buf);
@@ -529,24 +569,156 @@ function main() {
 main();
 '@ | Set-Content $extractorPath -Encoding UTF8
 
-    & node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
-    Remove-Item -Force $extractorPath -ErrorAction SilentlyContinue
-} else {
-    Write-Dim "No native claude binary found"
-    Write-Dim "Voice Mode will be unavailable"
-    Write-Dim "Install native first: https://claude.ai/install"
+# ─── Extract cli.js + native modules from Bun binary ──────────
+
+$VendorDir = Join-Path $ClawDir "vendor"
+if (Test-Path $VendorDir) { Remove-Item -Recurse -Force $VendorDir }
+New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
+
+$dstCli = Join-Path $ClawDir "cli.original.js"
+
+Write-Dim "Extracting cli.js from $(Split-Path $NativeBin -Leaf) ..."
+& node $extractorPath $NativeBin $ClawDir --cli-js 2>&1 | ForEach-Object { Write-Host "  $_" }
+if (-not (Test-Path $dstCli)) {
+    Write-Err "Failed to extract cli.js from native binary"
+    exit 1
 }
 
-# ─── Write wrapper (cli.js) ───────────────────────────
+Write-Dim "Extracting native modules from $(Split-Path $NativeBin -Leaf) ..."
+& node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+# Note: keep extractorPath around — repatch.mjs uses it on version drift
+
+# ─── Post-process cli.js for Bun runtime ──────────────────────
+
+Write-Dim "Rewriting bunfs paths and IIFE invocation ..."
+$postProc = Join-Path $ClawDir "post-process.mjs"
+@'
+import { readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const src = `${here}/cli.original.js`;
+const dst = `${here}/cli.original.cjs`;
+
+let code = readFileSync(src, 'utf8');
+
+code = code.replace(
+  /require\(['"](\/\$bunfs\/root\/([\w-]+)\.node)['"]\)/g,
+  (m, _full, name) =>
+    `require(require('path').join(__dirname,'vendor',${JSON.stringify(name)},\`\${process.arch==='arm64'?'arm64':'x64'}-\${process.platform==='darwin'?'darwin':process.platform==='linux'?'linux':'win32'}\`,${JSON.stringify(name + '.node')}))`,
+);
+
+code = code.replace(
+  /[\w$]+\.fileURLToPath\("file:\/\/\/home\/runner\/work\/claude-cli-internal\/claude-cli-internal\/[^"]*"\)/g,
+  () => '__filename',
+);
+
+code = code.replace(/\}\)\s*$/, '})(exports, require, module, __filename, __dirname)');
+
+writeFileSync(dst, code);
+unlinkSync(src);
+console.log(`cli.original.cjs: ${code.length} bytes`);
+'@ | Set-Content $postProc -Encoding UTF8
+& node $postProc 2>&1 | ForEach-Object { Write-Host "  $_" }
+if (-not (Test-Path (Join-Path $ClawDir "cli.original.cjs"))) {
+    Write-Err "Post-process failed"
+    exit 1
+}
+
+# Stamp source version so wrapper can detect drift on next launch
+Set-Content -Path (Join-Path $ClawDir ".source-version") -Value (Split-Path $NativeBin -Leaf) -Encoding ASCII
+Write-OK "cli.original.cjs ready ($(Split-Path $NativeBin -Leaf))"
+
+# ─── Write re-patch helper (used by wrapper on version drift) ─────────
 
 @'
-#!/usr/bin/env node
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
+#!/usr/bin/env bun
+import { spawnSync } from 'child_process';
+import { writeFileSync, existsSync, mkdirSync, rmSync } from 'fs';
+import { dirname, join, basename } from 'path';
+import { fileURLToPath } from 'url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const nativeBin = process.argv[2];
+
+if (!nativeBin || !existsSync(nativeBin)) {
+  console.error('repatch: native binary path required and must exist');
+  process.exit(1);
+}
+
+const vendor = join(here, 'vendor');
+rmSync(vendor, { recursive: true, force: true });
+mkdirSync(vendor, { recursive: true });
+
+const runtime = process.execPath;
+
+function run(label, args) {
+  const r = spawnSync(runtime, args, { cwd: here, stdio: 'inherit' });
+  if (r.status !== 0) {
+    console.error(`repatch: ${label} failed (exit ${r.status})`);
+    process.exit(1);
+  }
+}
+
+const extractor = join(here, 'extract-natives.mjs');
+const postProc = join(here, 'post-process.mjs');
+const patcher = join(here, 'patch.mjs');
+
+run('extract cli.js', [extractor, nativeBin, here, '--cli-js']);
+run('extract natives', [extractor, nativeBin, vendor]);
+run('post-process', [postProc]);
+run('patcher', [patcher]);
+
+writeFileSync(join(here, '.source-version'), basename(nativeBin) + '\n');
+console.log(`[clawgod] re-patched to ${basename(nativeBin)}`);
+'@ | Set-Content (Join-Path $ClawDir "repatch.mjs") -Encoding UTF8
+Write-OK "Re-patch helper installed (repatch.mjs)"
+
+# ─── Write wrapper (cli.cjs, runs under Bun) ──────────────────
+
+@'
+#!/usr/bin/env bun
+const { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, statSync } = require('fs');
+const { join, basename } = require('path');
+const { homedir } = require('os');
+const { spawnSync } = require('child_process');
 
 const claudeDir = join(homedir(), '.claude');
 const clawgodDir = join(homedir(), '.clawgod');
+
+// Version drift detection — see install.sh wrapper for full notes.
+try {
+  const stamp = join(__dirname, '.source-version');
+  const versionsDir = join(homedir(), '.local/share/claude/versions');
+  if (existsSync(versionsDir)) {
+    let latest = null, latestMtime = 0;
+    for (const name of readdirSync(versionsDir)) {
+      const p = join(versionsDir, name);
+      let st;
+      try { st = statSync(p); } catch { continue; }
+      if (!st.isFile() || st.size < 10 * 1024 * 1024) continue;
+      if (st.mtimeMs > latestMtime) { latestMtime = st.mtimeMs; latest = p; }
+    }
+    if (latest) {
+      const have = existsSync(stamp) ? readFileSync(stamp, 'utf8').trim() : '';
+      const want = basename(latest);
+      if (have && have !== want) {
+        process.stderr.write(`[clawgod] new Claude version detected (${want}, was ${have}); re-patching...\n`);
+        const repatch = join(__dirname, 'repatch.mjs');
+        if (existsSync(repatch)) {
+          const r = spawnSync(process.execPath, [repatch, latest], { stdio: 'inherit' });
+          if (r.status !== 0) {
+            process.stderr.write('[clawgod] re-patch failed; running previous patched copy\n');
+          }
+        }
+      }
+    }
+  }
+} catch (e) {
+  process.stderr.write(`[clawgod] drift check skipped: ${e.message}\n`);
+}
 const configDir = process.env.CLAUDE_CONFIG_DIR || (existsSync(claudeDir) ? claudeDir : clawgodDir);
 const providerDir = clawgodDir;
 const configFile = join(providerDir, 'provider.json');
@@ -570,24 +742,30 @@ if (existsSync(configFile)) {
   writeFileSync(configFile, JSON.stringify(defaultConfig, null, 2) + '\n');
 }
 
-if (config.apiKey) {
-  process.env.ANTHROPIC_API_KEY ??= config.apiKey;
+const hasProviderApiKey = !!config.apiKey;
+
+if (hasProviderApiKey) {
+  process.env.ANTHROPIC_API_KEY = config.apiKey;
+  if (config.baseURL) process.env.ANTHROPIC_BASE_URL = config.baseURL;
+  if (config.model) process.env.ANTHROPIC_MODEL = config.model;
+  if (config.smallModel) process.env.ANTHROPIC_SMALL_FAST_MODEL = config.smallModel;
+  process.env.CLAUDE_CONFIG_DIR = clawgodDir;
+  if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
+    process.env.ANTHROPIC_AUTH_TOKEN ??= config.apiKey;
+  }
+} else {
+  if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
+    process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
+  }
+  process.env.CLAUDE_CONFIG_DIR ??= configDir;
 }
-if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
-  process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
-}
-if (config.apiKey && config.model) {
-  process.env.ANTHROPIC_MODEL ??= config.model;
-}
-if (config.apiKey && config.smallModel) {
-  process.env.ANTHROPIC_SMALL_FAST_MODEL ??= config.smallModel;
-}
+
 if (config.timeoutMs) {
   process.env.API_TIMEOUT_MS ??= String(config.timeoutMs);
 }
 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
 process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
-process.env.CLAUDE_CONFIG_DIR ??= configDir;
+process.env.USE_BUILTIN_RIPGREP ??= '1';
 
 const featuresFile = join(providerDir, 'features.json');
 if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
@@ -598,9 +776,9 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
-await import('./cli.original.js');
-'@ | Set-Content (Join-Path $ClawDir "cli.js") -Encoding UTF8
-Write-OK "Wrapper created (cli.js)"
+require('./cli.original.cjs');
+'@ | Set-Content (Join-Path $ClawDir "cli.cjs") -Encoding UTF8
+Write-OK "Wrapper created (cli.cjs)"
 
 # ─── Write universal patcher ──────────────────────────
 # (Same Node.js patcher as bash version — extract from install.sh or inline)
@@ -618,26 +796,26 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const TARGET = join(__dirname, 'cli.original.js');
+const TARGET = join(__dirname, 'cli.original.cjs');
 const BACKUP = TARGET + '.bak';
 
 const patches = [
   {
     name: 'USER_TYPE → ant',
-    pattern: /function (\w+)\(\)\{return"external"\}/g,
+    pattern: /function ([\w$]+)\(\)\{return"external"\}/g,
     replacer: (m, fn) => `function ${fn}(){return"ant"}`,
     sentinel: 'return"external"',
   },
   {
     name: 'GrowthBook env overrides',
-    pattern: /function (\w+)\(\)\{if\(!(\w+)\)(\w+)=!0;return (\w+)\}/g,
-    replacer: (m, fn, flag, flag2, val) =>
-      `function ${fn}(){if(!${flag}){${flag2}=!0;try{let e=process.env.CLAUDE_INTERNAL_FC_OVERRIDES;if(e)${val}=JSON.parse(e)}catch(e){}}return ${val}}`,
+    pattern: /function ([\w$]+)\(\)\{if\(!([\w$]+)\)\2=!0;return ([\w$]+)\}/g,
+    replacer: (m, fn, flag, val) =>
+      `function ${fn}(){if(!${flag}){${flag}=!0;try{let e=process.env.CLAUDE_INTERNAL_FC_OVERRIDES;if(e)${val}=JSON.parse(e)}catch(e){}}return ${val}}`,
     unique: true,
   },
   {
     name: 'GrowthBook config overrides',
-    pattern: /function (\w+)\(\)\{return\}(function)/g,
+    pattern: /function ([\w$]+)\(\)\{return\}(function)/g,
     replacer: (m, fn, next) =>
       `function ${fn}(){try{return j8().growthBookOverrides??null}catch{return null}}${next}`,
     selectIndex: 0,
@@ -649,17 +827,17 @@ const patches = [
   },
   {
     name: 'Agent Teams always enabled',
-    pattern: /function (\w+)\(\)\{if\(!\w+\(process\.env\.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\)&&!\w+\(\)\)return!1;if\(!\w+\("tengu_amber_flint",!0\)\)return!1;return!0\}/g,
+    pattern: /function ([\w$]+)\(\)\{if\(![\w$]+\(process\.env\.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\)&&![\w$]+\(\)\)return!1;if\(![\w$]+\("tengu_amber_flint",!0\)\)return!1;return!0\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Computer Use subscription bypass',
-    pattern: /function (\w+)\(\)\{let \w+=\w+\(\);return \w+==="max"\|\|\w+==="pro"\}/g,
+    pattern: /function ([\w$]+)\(\)\{let [\w$]+=[\w$]+\(\);return [\w$]+==="max"\|\|[\w$]+==="pro"\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Computer Use default enabled',
-    pattern: /(\w+=)\{enabled:!1,pixelValidation/g,
+    pattern: /([\w$]+=)\{enabled:!1,pixelValidation/g,
     replacer: (m, prefix) => `${prefix}{enabled:!0,pixelValidation`,
   },
   {
@@ -670,8 +848,9 @@ const patches = [
   },
   {
     name: 'Ultrareview enable',
-    pattern: /function (\w+)\(\)\{return \w+\("tengu_review_bughunter_config",null\)\?\.enabled===!0\}/g,
-    replacer: (m, fn) => `function ${fn}(){return!0}`,
+    pattern: /function ([\w$]+)\(\)\{return [\w$]+\("tengu_review_bughunter_config",null\)(\?\.enabled===!0)?\}/g,
+    replacer: (m, fn) => `function ${fn}(){return{enabled:!0}}`,
+    sentinel: '"tengu_review_bughunter_config"',
   },
   {
     name: 'Logo + brand color → green (RGB dark)',
@@ -704,24 +883,43 @@ const patches = [
     replacer: () => 'claudeShimmer:"rgb(34,197,94)"',
   },
   {
+    name: 'Computer Use gate bypass',
+    pattern: /function ([\w$]+)\(\)\{return [\w$]+\(\)&&[\w$]+\(\)\.enabled\}/g,
+    replacer: (m, fn) => `function ${fn}(){return!0}`,
+  },
+  {
+    name: 'Voice Mode enable (bypass GrowthBook kill)',
+    pattern: /function ([\w$]+)\(\)\{return![\w$]+\("tengu_amber_quartz_disabled",!1\)\}/g,
+    replacer: (m, fn) => `function ${fn}(){return!0}`,
+  },
+  {
+    name: 'Auto-mode unlock for third-party API',
+    pattern: /let ([\w$]+)=[\w$]+\(\);if\(\1!=="firstParty"&&\1!=="anthropicAws"\)return!1;/g,
+    replacer: () => '',
+    sentinel: '!=="firstParty"&&',
+  },
+  {
     name: 'Hex brand color → green',
     pattern: /#da7756/g,
     replacer: () => '#22c55e',
   },
   {
     name: 'Remove CYBER_RISK_INSTRUCTION',
-    pattern: /(\w+)="IMPORTANT: Assist with authorized security testing[^"]*"/g,
+    pattern: /([\w$]+)="IMPORTANT: Assist with authorized security testing[^"]*"/g,
     replacer: (m, varName) => `${varName}=""`,
+    sentinel: 'Assist with authorized security testing',
   },
   {
     name: 'Remove URL generation restriction',
-    pattern: /\n\$\{\w+\}\nIMPORTANT: You must NEVER generate or guess URLs[^.]*\. You may use URLs provided by the user in their messages or local files\./g,
+    pattern: /\n\$\{[\w$]+\}\nIMPORTANT: You must NEVER generate or guess URLs[^.]*\. You may use URLs provided by the user in their messages or local files\./g,
     replacer: () => '',
+    sentinel: 'IMPORTANT: You must NEVER generate or guess URLs',
   },
   {
     name: 'Remove cautious actions section',
-    pattern: /function (\w+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
+    pattern: /function ([\w$]+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
     replacer: (m, fn) => `function ${fn}(){return\`\`}`,
+    sentinel: '# Executing actions with care',
   },
   {
     name: 'Remove "Not logged in" notice',
@@ -731,19 +929,19 @@ const patches = [
   },
   {
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
-    replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
+    pattern: /([\w$]+)\(\)!=="ant"(&&[\w$]+\.has\([\w$]+\.attachment\.type\)|\)\{if\([\w$]+\.attachment\.type==="hook_additional_context")/g,
+    replacer: (m) => m.replace(/([\w$]+)\(\)!=="ant"/, 'false'),
     optional: true,
   },
   {
     name: 'Message list filter bypass (legacy ternary)',
-    pattern: /(\w+)\(\)!=="ant"\?(\w+)\((\w+),(\w+)\((\w+)\)\):(\w+)/g,
+    pattern: /([\w$]+)\(\)!=="ant"\?([\w$]+)\(([\w$]+),([\w$]+)\(([\w$]+)\)\):([\w$]+)/g,
     replacer: (m, fn, tRY, underscore, sRY, K, fallback) => fallback,
     optional: true,
   },
   {
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)==="ant"\)return (\w+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\(([\w$]+)\(\)==="ant"\)return ([\w$]+);let ([\w$]+)=([\w$]+) instanceof Set\?\4:([\w$]+)\(\4\);return ([\w$]+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,
   },
@@ -773,7 +971,7 @@ const version = verMatch ? verMatch[1] : 'unknown';
 
 console.log(`\n${'='.repeat(55)}`);
 console.log(`  ClawGod (universal)`);
-console.log(`  Target: cli.original.js (v${version})`);
+console.log(`  Target: cli.original.cjs (v${version})`);
 console.log(`  Mode: ${dryRun ? 'DRY RUN' : verify ? 'VERIFY' : 'APPLY'}`);
 console.log(`${'='.repeat(55)}\n`);
 
@@ -818,18 +1016,18 @@ console.log(`  Result: ${applied} applied, ${skipped} skipped, ${failed} failed`
 if (!dryRun && !verify && applied > 0) {
   if (!existsSync(BACKUP)) { copyFileSync(TARGET, BACKUP); console.log(`  Backup: ${BACKUP}`); }
   writeFileSync(TARGET, code, 'utf8');
-  console.log(`  Written: cli.original.js (${code.length - origSize} bytes)`);
+  console.log(`  Written: cli.original.cjs (${code.length - origSize} bytes)`);
 }
 console.log(`${'='.repeat(55)}\n`);
 '@
 
-Set-Content (Join-Path $ClawDir "patch.js") $patcherCode -Encoding UTF8
-Write-OK "Patcher created (patch.js)"
+Set-Content (Join-Path $ClawDir "patch.mjs") $patcherCode -Encoding UTF8
+Write-OK "Patcher created (patch.mjs)"
 
 # ─── Apply patches ────────────────────────────────────
 
 Write-Dim "Applying patches ..."
-node (Join-Path $ClawDir "patch.js")
+node (Join-Path $ClawDir "patch.mjs")
 
 # ─── Create default configs ───────────────────────────
 
@@ -852,8 +1050,9 @@ if (-not (Test-Path $featuresFile)) {
 
 # ─── Replace claude command ───────────────────────────
 
-$cliPath = (Join-Path $ClawDir "cli.js") -replace '\\', '\\'
-$launcherContent = "@echo off`r`nnode `"$cliPath`" %*"
+$cliPath = (Join-Path $ClawDir "cli.cjs") -replace '\\', '\\'
+$bunPath = $BunBin -replace '\\', '\\'
+$launcherContent = "@echo off`r`n`"$bunPath`" `"$cliPath`" %*"
 
 # Find and back up original claude
 $claudeCmd = Join-Path $BinDir "claude.cmd"
@@ -920,11 +1119,16 @@ if (Test-Path $claudeExe) {
 }
 
 
-# Write .cmd launcher for 'claude'
-foreach ($cmd in @("claude")) {
+# Write .cmd launcher for both 'claude' and the explicit 'clawgod' alias.
+# Why both:
+#  - claude.cmd may be shadowed by a claude.exe higher in PATH
+#  - clawgod.cmd has no .exe competitor, so it always works
+#  - User can invoke patched explicitly via `clawgod` regardless of which
+#    binary 'claude' resolves to
+foreach ($cmd in @("claude", "clawgod")) {
     $launcherContent | Set-Content (Join-Path $BinDir "$cmd.cmd") -Encoding ASCII
 }
-Write-OK "Command 'claude' → patched"
+Write-OK "Commands 'claude' + 'clawgod' → patched"
 
 # ─── Ensure BinDir is in PATH ─────────────────────────
 
