@@ -121,17 +121,36 @@ catch {
     exit 1
 }
 
-# ─── Locate native Bun binary (must be present — cli.js source) ───────
+# ─── Locate native Bun binary (cli.js source) ──────────────────────────
+# Sources, in priority order:
+#  1. Existing official install:    %USERPROFILE%\.local\share\claude\versions\<v>
+#  2. Prior clawgod backup:          $BinDir\claude.orig.exe
+#  3. npm global install (postinstalled binary at <npm root -g>):
+#       @anthropic-ai\claude-code\bin\claude.exe
+#       @anthropic-ai\claude-code-win32-<arch>\claude.exe
+#  4. bun global install (~/.bun/install/global/node_modules/...)
+#  5. npm registry fallback:         npm pack @anthropic-ai/claude-code-win32-<arch>
 
 New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BinDir  | Out-Null
 
 $NativeBin = $null
+$NativeBinLabel = $null
+$NativeBinTmpDir = $null
+
+# Detect platform suffix
+if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+    $arch = "arm64"
+} else {
+    $arch = "x64"
+}
+$platformSuffix = "win32-$arch"
+
+# 1. Official install dirs
 $searchPaths = @(
     (Join-Path $env:USERPROFILE ".local\share\claude\versions"),
     (Join-Path $env:LOCALAPPDATA "Programs\claude-code")
 )
-
 foreach ($dir in $searchPaths) {
     if (Test-Path $dir -PathType Container) {
         $candidates = Get-ChildItem $dir -File -ErrorAction SilentlyContinue |
@@ -140,17 +159,170 @@ foreach ($dir in $searchPaths) {
             Sort-Object LastWriteTime -Descending
         if ($candidates) {
             $NativeBin = $candidates[0].FullName
+            $NativeBinLabel = $candidates[0].Name
             break
         }
     }
 }
 
-# Also check backed-up claude.orig.exe
+# 2. Prior clawgod backup
 if (-not $NativeBin) {
     $origExe = Join-Path $BinDir "claude.orig.exe"
     if ((Test-Path $origExe) -and (Get-Item $origExe).Length -gt 10MB) {
         $NativeBin = $origExe
+        $NativeBinLabel = "claude.orig.exe"
     }
+}
+
+# 3. npm global install. The postinstall hook copies the platform binary to
+#    <npm root -g>\@anthropic-ai\claude-code\bin\claude.exe (the file name
+#    stays as .exe on every platform — that's how the npm wrapper is built).
+if (-not $NativeBin) {
+    try {
+        $npmRoot = (& npm root -g 2>$null | Out-String).Trim()
+        if ($npmRoot -and (Test-Path $npmRoot)) {
+            $candList = @(
+                (Join-Path $npmRoot "@anthropic-ai\claude-code\bin\claude.exe"),
+                (Join-Path $npmRoot "@anthropic-ai\claude-code-$platformSuffix\claude.exe")
+            )
+            foreach ($c in $candList) {
+                if ((Test-Path $c) -and (Get-Item $c).Length -gt 10MB) {
+                    $NativeBin = $c
+                    # Read upstream version for stamp
+                    $pkgJson = Join-Path $npmRoot "@anthropic-ai\claude-code\package.json"
+                    if (Test-Path $pkgJson) {
+                        try {
+                            $NativeBinLabel = (Get-Content $pkgJson -Raw | ConvertFrom-Json).version
+                        } catch { $NativeBinLabel = "npm-global" }
+                    } else {
+                        $NativeBinLabel = "npm-global"
+                    }
+                    break
+                }
+            }
+        }
+    } catch {}
+}
+
+# 4. bun global install
+if (-not $NativeBin) {
+    $bunGlobalRoot = Join-Path $env:USERPROFILE ".bun\install\global\node_modules"
+    if (Test-Path $bunGlobalRoot) {
+        $candList = @(
+            (Join-Path $bunGlobalRoot "@anthropic-ai\claude-code\bin\claude.exe"),
+            (Join-Path $bunGlobalRoot "@anthropic-ai\claude-code-$platformSuffix\claude.exe")
+        )
+        foreach ($c in $candList) {
+            if ((Test-Path $c) -and (Get-Item $c).Length -gt 10MB) {
+                $NativeBin = $c
+                $pkgJson = Join-Path $bunGlobalRoot "@anthropic-ai\claude-code\package.json"
+                if (Test-Path $pkgJson) {
+                    try {
+                        $NativeBinLabel = (Get-Content $pkgJson -Raw | ConvertFrom-Json).version
+                    } catch { $NativeBinLabel = "bun-global" }
+                } else {
+                    $NativeBinLabel = "bun-global"
+                }
+                break
+            }
+        }
+    }
+}
+
+# 5. npm registry fallback — pull the platform tarball directly via Node.
+#    Avoids depending on `npm` and `tar` being on PATH (older Windows 10
+#    builds lack tar.exe; some PowerShell shims mangle `& npm`). Node is
+#    already a hard prerequisite for the patcher, so reuse it.
+if (-not $NativeBin) {
+    $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
+    Write-Dim "No local Claude Code binary found, fetching $npmPkg from npm registry ..."
+    $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Force -Path $NativeBinTmpDir | Out-Null
+    $fetchScript = Join-Path $NativeBinTmpDir "fetch.mjs"
+    @'
+// Download a scoped npm tarball (no npm CLI dependency) and extract it
+// using Node's built-in zlib + a minimal POSIX tar parser.
+import { request as httpsRequest } from 'node:https';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { gunzipSync } from 'node:zlib';
+
+const [, , pkgSpec, outDir] = process.argv;
+const last = pkgSpec.lastIndexOf('@');
+const pkg = last > 0 ? pkgSpec.slice(0, last) : pkgSpec;
+const ver = last > 0 ? pkgSpec.slice(last + 1) : 'latest';
+
+function get(url) {
+  return new Promise((resolve, reject) => {
+    httpsRequest(url, { method: 'GET' }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return get(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    }).on('error', reject).end();
+  });
+}
+
+const metaBuf = await get(`https://registry.npmjs.org/${pkg}/${ver}`);
+const meta = JSON.parse(metaBuf.toString('utf8'));
+console.log(`Resolved ${pkg}@${meta.version}`);
+const tgz = await get(meta.dist.tarball);
+console.log(`Downloaded ${(tgz.length / 1024 / 1024).toFixed(1)} MB`);
+
+const buf = gunzipSync(tgz);
+mkdirSync(outDir, { recursive: true });
+let off = 0, files = 0;
+while (off + 512 <= buf.length) {
+  const name = buf.slice(off, off + 100).toString('utf8').replace(/\0+$/, '');
+  if (!name) break;
+  const sizeOct = buf.slice(off + 124, off + 136).toString('utf8').replace(/[\0\s]+$/, '');
+  const size = parseInt(sizeOct, 8) || 0;
+  const typeflag = String.fromCharCode(buf[off + 156]);
+  off += 512;
+  if (typeflag === '0' || typeflag === '\0') {
+    const dest = join(outDir, name);
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, buf.slice(off, off + size));
+    files++;
+  }
+  off += Math.ceil(size / 512) * 512;
+}
+console.log(`Extracted ${files} files`);
+console.log(`VERSION=${meta.version}`);
+'@ | Set-Content $fetchScript -Encoding UTF8
+
+    $output = & node $fetchScript "$npmPkg@latest" $NativeBinTmpDir 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host "  $_" }
+    Remove-Item -Force $fetchScript -ErrorAction SilentlyContinue
+
+    if ($exitCode -ne 0) {
+        Remove-Item -Recurse -Force $NativeBinTmpDir -ErrorAction SilentlyContinue
+        Write-Err "Fetch failed (node exit $exitCode). Install the official binary manually:"
+        Write-Err "    irm https://claude.ai/install.ps1 | iex"
+        exit 1
+    }
+
+    $cand = Join-Path $NativeBinTmpDir "package\claude.exe"
+    if ((Test-Path $cand) -and (Get-Item $cand).Length -gt 10MB) {
+        $NativeBin = $cand
+        # Pull the version line printed by fetch.mjs ("VERSION=2.1.x")
+        $verLine = $output | Where-Object { $_ -match '^VERSION=' } | Select-Object -First 1
+        if ($verLine) { $NativeBinLabel = ($verLine -replace '^VERSION=', '').Trim() }
+        else { $NativeBinLabel = "npm-latest" }
+    } else {
+        Remove-Item -Recurse -Force $NativeBinTmpDir -ErrorAction SilentlyContinue
+        Write-Err "Tarball downloaded but expected package\claude.exe was missing or too small."
+        Write-Err "  Tempdir kept for inspection: $NativeBinTmpDir"
+        exit 1
+    }
+    Write-OK "Downloaded $npmPkg@$NativeBinLabel"
 }
 
 if (-not $NativeBin) {
@@ -459,6 +631,8 @@ function identifyDylib(buf, dylib) {
 }
 
 // ─── cli.js text extraction (Bun standalone) ─────────────────────────
+// Two anchors: bunfs path (primary, Mach-O/ELF) and cli_after_main_complete
+// (fallback, used when Windows PE builds omit the bunfs path string).
 
 const CLI_PATH_MARKER = Buffer.from('file:///$bunfs/root/src/entrypoints/cli.js');
 const CLI_FN_MARKER = Buffer.from('(function(exports, require, module');
@@ -466,14 +640,25 @@ const CLI_TAIL_MARKER = Buffer.from('cli_after_main_complete")}');
 const CLI_END_MARKER = Buffer.from(');})');
 
 function extractCliJs(buf) {
+  let fnStart = -1;
   const pathOff = buf.indexOf(CLI_PATH_MARKER);
-  if (pathOff === -1) return null;
-  const fnStart = buf.indexOf(CLI_FN_MARKER, pathOff);
-  if (fnStart === -1 || fnStart - pathOff > 1024) return null;
-  const tailMark = buf.indexOf(CLI_TAIL_MARKER, fnStart);
-  if (tailMark === -1) return null;
-  const ending = buf.indexOf(CLI_END_MARKER, tailMark);
-  if (ending === -1 || ending - tailMark > 4096) return null;
+  if (pathOff !== -1) {
+    const candidate = buf.indexOf(CLI_FN_MARKER, pathOff);
+    if (candidate !== -1 && candidate - pathOff <= 1024) fnStart = candidate;
+  }
+
+  if (fnStart === -1) {
+    const tailMark = buf.indexOf(CLI_TAIL_MARKER);
+    if (tailMark === -1) return null;
+    const candidate = buf.lastIndexOf(CLI_FN_MARKER, tailMark);
+    if (candidate === -1 || tailMark - candidate < 1024 * 1024) return null;
+    fnStart = candidate;
+  }
+
+  const tailFromFn = buf.indexOf(CLI_TAIL_MARKER, fnStart);
+  if (tailFromFn === -1) return null;
+  const ending = buf.indexOf(CLI_END_MARKER, tailFromFn);
+  if (ending === -1 || ending - tailFromFn > 4096) return null;
   return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
 }
 
@@ -577,14 +762,14 @@ New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
 
 $dstCli = Join-Path $ClawDir "cli.original.js"
 
-Write-Dim "Extracting cli.js from $(Split-Path $NativeBin -Leaf) ..."
+Write-Dim "Extracting cli.js from $NativeBinLabel ..."
 & node $extractorPath $NativeBin $ClawDir --cli-js 2>&1 | ForEach-Object { Write-Host "  $_" }
 if (-not (Test-Path $dstCli)) {
     Write-Err "Failed to extract cli.js from native binary"
     exit 1
 }
 
-Write-Dim "Extracting native modules from $(Split-Path $NativeBin -Leaf) ..."
+Write-Dim "Extracting native modules from $NativeBinLabel ..."
 & node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
 
 # Note: keep extractorPath around — repatch.mjs uses it on version drift
@@ -628,8 +813,15 @@ if (-not (Test-Path (Join-Path $ClawDir "cli.original.cjs"))) {
 }
 
 # Stamp source version so wrapper can detect drift on next launch
-Set-Content -Path (Join-Path $ClawDir ".source-version") -Value (Split-Path $NativeBin -Leaf) -Encoding ASCII
-Write-OK "cli.original.cjs ready ($(Split-Path $NativeBin -Leaf))"
+Set-Content -Path (Join-Path $ClawDir ".source-version") -Value $NativeBinLabel -Encoding ASCII
+
+# If we pulled the binary from npm into a tmpdir, clean up — extraction
+# is done; drift detection only consults %USERPROFILE%\.local\share\claude\versions\.
+if ($NativeBinTmpDir -and (Test-Path $NativeBinTmpDir)) {
+    Remove-Item -Recurse -Force $NativeBinTmpDir -ErrorAction SilentlyContinue
+}
+
+Write-OK "cli.original.cjs ready ($NativeBinLabel)"
 
 # ─── Write re-patch helper (used by wrapper on version drift) ─────────
 

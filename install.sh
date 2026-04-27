@@ -158,6 +158,62 @@ if [ -z "$NATIVE_BIN" ] && [ -e "$BIN_DIR/claude.orig" ]; then
   [ -n "$NATIVE_BIN" ] && NATIVE_BIN_LABEL="$(basename "$NATIVE_BIN")"
 fi
 
+# Detect platform suffix (also used by the npm fallback below)
+case "$(uname -s)" in
+  Darwin) os="darwin" ;;
+  Linux)  os="linux" ;;
+  *)      os="" ;;
+esac
+case "$(uname -m)" in
+  arm64|aarch64) arch="arm64" ;;
+  x86_64|amd64)  arch="x64" ;;
+  *)             arch="" ;;
+esac
+if [ "$os" = "linux" ] && (ldd /bin/ls 2>/dev/null | grep -q musl); then
+  PLATFORM="${os}-${arch}-musl"
+else
+  PLATFORM="${os}-${arch}"
+fi
+
+# Helper: scan a node_modules root for the npm-globally-installed binary.
+# Two layouts to consider:
+#  - <root>/@anthropic-ai/claude-code/bin/claude.exe — the wrapper package's
+#    postinstall always copies the platform binary to this path; the .exe
+#    suffix is upstream's choice and is kept on every OS.
+#  - <root>/@anthropic-ai/claude-code-<platform>/claude — the platform
+#    package's own binary, used directly when the wrapper postinstall was
+#    skipped (e.g. --omit=optional).
+scan_node_modules_root() {
+  local root="$1" tag="$2" cand sz
+  [ -d "$root" ] || return 1
+  for cand in \
+      "$root/@anthropic-ai/claude-code/bin/claude.exe" \
+      "$root/@anthropic-ai/claude-code-${PLATFORM}/claude"; do
+    [ -f "$cand" ] || continue
+    sz=$(stat -f%z "$cand" 2>/dev/null || stat -c%s "$cand" 2>/dev/null || echo 0)
+    [ "$sz" -gt 10000000 ] || continue
+    NATIVE_BIN="$cand"
+    if [ -f "$root/@anthropic-ai/claude-code/package.json" ]; then
+      NATIVE_BIN_LABEL=$(node -e "console.log(require('$root/@anthropic-ai/claude-code/package.json').version)" 2>/dev/null || echo "$tag")
+    else
+      NATIVE_BIN_LABEL="$tag"
+    fi
+    return 0
+  done
+  return 1
+}
+
+# Fallback: existing npm `-g` install
+if [ -z "$NATIVE_BIN" ] && command -v npm &>/dev/null; then
+  NPM_GLOBAL=$(npm root -g 2>/dev/null)
+  [ -n "$NPM_GLOBAL" ] && scan_node_modules_root "$NPM_GLOBAL" "npm-global"
+fi
+
+# Fallback: existing bun `add -g` install
+if [ -z "$NATIVE_BIN" ]; then
+  scan_node_modules_root "$HOME/.bun/install/global/node_modules" "bun-global"
+fi
+
 # Last-resort fallback: pull the Bun standalone binary from the npm registry.
 # Anthropic publishes per-platform packages (e.g. claude-code-darwin-arm64);
 # their tarball ships the binary directly under package/.
@@ -169,20 +225,9 @@ if [ -z "$NATIVE_BIN" ]; then
     warn "  or install npm so we can fetch it from the registry."
     exit 1
   fi
-  case "$(uname -s)" in
-    Darwin) os="darwin" ;;
-    Linux)  os="linux" ;;
-    *)      warn "Unsupported OS: $(uname -s)"; exit 1 ;;
-  esac
-  case "$(uname -m)" in
-    arm64|aarch64) arch="arm64" ;;
-    x86_64|amd64)  arch="x64" ;;
-    *)             warn "Unsupported arch: $(uname -m)"; exit 1 ;;
-  esac
-  if [ "$os" = "linux" ] && (ldd /bin/ls 2>/dev/null | grep -q musl); then
-    PLATFORM="${os}-${arch}-musl"
-  else
-    PLATFORM="${os}-${arch}"
+  if [ -z "$os" ] || [ -z "$arch" ]; then
+    warn "Unsupported platform: $(uname -s) $(uname -m)"
+    exit 1
   fi
   NPM_PKG="@anthropic-ai/claude-code-${PLATFORM}"
   dim "No local Claude Code binary found, fetching $NPM_PKG from npm ..."
@@ -191,16 +236,14 @@ if [ -z "$NATIVE_BIN" ]; then
     TARBALL=$(ls "$NATIVE_BIN_TMPDIR"/*.tgz 2>/dev/null | head -1)
     if [ -n "$TARBALL" ]; then
       ( cd "$NATIVE_BIN_TMPDIR" && tar xzf "$TARBALL" )
-      for cand in "$NATIVE_BIN_TMPDIR/package/claude" "$NATIVE_BIN_TMPDIR/package/claude.exe"; do
-        if [ -f "$cand" ]; then
-          sz=$(stat -f%z "$cand" 2>/dev/null || stat -c%s "$cand" 2>/dev/null || echo 0)
-          if [ "$sz" -gt 10000000 ]; then
-            NATIVE_BIN="$cand"
-            NATIVE_BIN_LABEL=$(node -e "console.log(require('$NATIVE_BIN_TMPDIR/package/package.json').version)" 2>/dev/null || echo "npm-latest")
-            break
-          fi
+      cand="$NATIVE_BIN_TMPDIR/package/claude"
+      if [ -f "$cand" ]; then
+        sz=$(stat -f%z "$cand" 2>/dev/null || stat -c%s "$cand" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 10000000 ]; then
+          NATIVE_BIN="$cand"
+          NATIVE_BIN_LABEL=$(node -e "console.log(require('$NATIVE_BIN_TMPDIR/package/package.json').version)" 2>/dev/null || echo "npm-latest")
         fi
-      done
+      fi
     fi
   fi
   if [ -z "$NATIVE_BIN" ]; then
@@ -518,6 +561,13 @@ function identifyDylib(buf, dylib) {
 }
 
 // ─── cli.js text extraction (Bun standalone) ─────────────────────────
+//
+// Two-stage anchor strategy:
+//  1. Primary: Bun's bunfs path marker, observed in Mach-O / ELF builds.
+//  2. Fallback: an application-level invariant ("cli_after_main_complete")
+//     followed by a backwards scan to the IIFE start. Some Windows PE
+//     builds don't appear to embed the bunfs path string we expect, so
+//     this fallback recovers the same payload via app-level signals.
 
 const CLI_PATH_MARKER = Buffer.from('file:///$bunfs/root/src/entrypoints/cli.js');
 const CLI_FN_MARKER = Buffer.from('(function(exports, require, module');
@@ -525,14 +575,32 @@ const CLI_TAIL_MARKER = Buffer.from('cli_after_main_complete")}');
 const CLI_END_MARKER = Buffer.from(');})');
 
 function extractCliJs(buf) {
+  // Primary anchor
+  let fnStart = -1;
   const pathOff = buf.indexOf(CLI_PATH_MARKER);
-  if (pathOff === -1) return null;
-  const fnStart = buf.indexOf(CLI_FN_MARKER, pathOff);
-  if (fnStart === -1 || fnStart - pathOff > 1024) return null;
-  const tailMark = buf.indexOf(CLI_TAIL_MARKER, fnStart);
-  if (tailMark === -1) return null;
-  const ending = buf.indexOf(CLI_END_MARKER, tailMark);
-  if (ending === -1 || ending - tailMark > 4096) return null;
+  if (pathOff !== -1) {
+    const candidate = buf.indexOf(CLI_FN_MARKER, pathOff);
+    if (candidate !== -1 && candidate - pathOff <= 1024) fnStart = candidate;
+  }
+
+  // Fallback anchor: walk back from the source-level tail marker.
+  if (fnStart === -1) {
+    const tailMark = buf.indexOf(CLI_TAIL_MARKER);
+    if (tailMark === -1) return null;
+    const candidate = buf.lastIndexOf(CLI_FN_MARKER, tailMark);
+    // The IIFE wraps the entire ~13 MB cli.js, so a valid candidate must
+    // sit at least 1 MB before the tail marker. Smaller gaps mean we
+    // matched a different (function(exports... wrapper for a sub-module.
+    if (candidate === -1 || tailMark - candidate < 1024 * 1024) return null;
+    fnStart = candidate;
+  }
+
+  // Resolve the IIFE close — search forward from fnStart so that we close
+  // the wrapper we actually opened, regardless of which anchor located it.
+  const tailFromFn = buf.indexOf(CLI_TAIL_MARKER, fnStart);
+  if (tailFromFn === -1) return null;
+  const ending = buf.indexOf(CLI_END_MARKER, tailFromFn);
+  if (ending === -1 || ending - tailFromFn > 4096) return null;
   return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
 }
 
