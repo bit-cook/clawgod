@@ -24,11 +24,11 @@ permissions:
 
 jobs:
   smoke:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-13]
-    runs-on: ${{ matrix.os }}
+    # Single Linux runner — a Linux failure almost always means cross-platform
+    # breakage upstream. macOS / Windows runners are 10x / 2x more expensive
+    # than Linux on shared-tier accounting, so we don't burn them on a daily
+    # signal.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -119,12 +119,11 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const platform = '${{ matrix.os }}';
             const stamp = path.join(process.env.HOME, '.clawgod', '.source-version');
             const claudeVersion = fs.existsSync(stamp)
               ? fs.readFileSync(stamp, 'utf8').trim()
               : 'unknown';
-            const title = `compat-daily: ${platform} broke (claude ${claudeVersion})`;
+            const title = `compat-daily: broke (claude ${claudeVersion})`;
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const { data: open } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
@@ -148,7 +147,7 @@ jobs:
                 title,
                 labels: ['compat-broken', 'bug'],
                 body: [
-                  `Daily compatibility run failed on \`${platform}\`.`,
+                  `Daily compatibility run failed on \`ubuntu-latest\`.`,
                   ``,
                   `- Claude binary: \`${claudeVersion}\``,
                   `- Run: ${runUrl}`,

@@ -204,14 +204,18 @@ scan_node_modules_root() {
 }
 
 # Fallback: existing npm `-g` install
+# `|| true` because scan_node_modules_root returns 1 on a clean miss, and
+# under `set -e` the trailing && or the last command of a then-block would
+# turn that into a fatal exit — preventing us from ever reaching the npm
+# registry fallback below.
 if [ -z "$NATIVE_BIN" ] && command -v npm &>/dev/null; then
   NPM_GLOBAL=$(npm root -g 2>/dev/null)
-  [ -n "$NPM_GLOBAL" ] && scan_node_modules_root "$NPM_GLOBAL" "npm-global"
+  [ -n "$NPM_GLOBAL" ] && scan_node_modules_root "$NPM_GLOBAL" "npm-global" || true
 fi
 
 # Fallback: existing bun `add -g` install
 if [ -z "$NATIVE_BIN" ]; then
-  scan_node_modules_root "$HOME/.bun/install/global/node_modules" "bun-global"
+  scan_node_modules_root "$HOME/.bun/install/global/node_modules" "bun-global" || true
 fi
 
 # Last-resort fallback: pull the Bun standalone binary from the npm registry.
