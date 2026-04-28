@@ -43,7 +43,7 @@ echo ""
 # ─── Uninstall ─────────────────────────────────────────
 
 if [ "$UNINSTALL" = "1" ]; then
-  CLAUDE_BIN=$(which claude 2>/dev/null)
+  CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
   for DIR in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR"; do
     [ -z "$DIR" ] && continue
     if [ -e "$DIR/claude.orig" ]; then
@@ -1302,8 +1302,11 @@ if [ ! -x \"\$BUN_BIN\" ]; then
 fi
 exec \"\$BUN_BIN\" \"\$CLAWGOD_CLI\" \"\$@\""
 
-# Detect where claude is actually installed (supports native, npm, pnpm, yarn)
-CLAUDE_BIN=$(which claude 2>/dev/null)
+# Detect where claude is actually installed (supports native, npm, pnpm, yarn).
+# `command -v` is a POSIX builtin (works even on minimal images that no
+# longer ship `which`); `|| true` keeps a clean miss from tripping
+# `set -e` via the assignment's exit status under bash 5+.
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 if [ -z "$CLAUDE_BIN" ]; then
   # No claude in PATH — use default location
   CLAUDE_BIN="$BIN_DIR/claude"
