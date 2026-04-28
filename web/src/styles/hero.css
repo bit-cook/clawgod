@@ -44,6 +44,9 @@
   letter-spacing: -0.045em;
   line-height: 1;
   margin-bottom: 18px;
+  /* Inherits --font-sans, which now uses 'Inter Fallback' (a metric-
+   * aligned override of Arial) before Inter loads — so the eventual
+   * Inter swap is geometrically invisible. See tokens.css. */
 }
 
 .hero h1 .accent {

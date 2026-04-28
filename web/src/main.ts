@@ -8,9 +8,12 @@
  *   - sticky-topbar shadow on scroll
  *   - hydrate the verified-version pill from the daily-CI badge JSON
  *   - hydrate the GitHub stargazer + total-download chips
+ *
+ * Note: CSS is intentionally NOT imported here. It's loaded as a
+ * <link rel="stylesheet"> in index.html so it arrives synchronously
+ * with the HTML — importing CSS through this module would chain it
+ * behind the deferred JS fetch and cause a Flash of Unstyled Content.
  */
-
-import './styles/index.css';
 
 const REPO = '0Chencc/clawgod';
 const BADGES_JSON = `https://raw.githubusercontent.com/${REPO}/badges/claude-version.json`;
