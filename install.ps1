@@ -123,14 +123,8 @@ catch {
 }
 
 # ─── Locate native Bun binary (cli.js source) ──────────────────────────
-# Sources, in priority order:
-#  1. Existing official install:    %USERPROFILE%\.local\share\claude\versions\<v>
-#  2. Prior clawgod backup:          $BinDir\claude.orig.exe
-#  3. npm global install (postinstalled binary at <npm root -g>):
-#       @anthropic-ai\claude-code\bin\claude.exe
-#       @anthropic-ai\claude-code-win32-<arch>\claude.exe
-#  4. bun global install (~/.bun/install/global/node_modules/...)
-#  5. npm registry fallback:         npm pack @anthropic-ai/claude-code-win32-<arch>
+# Source: npm registry (@anthropic-ai/claude-code-win32-<arch>).
+# Local binary detection is intentionally skipped — see policy note below.
 
 New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BinDir  | Out-Null
@@ -147,81 +141,26 @@ if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq 
 }
 $platformSuffix = "win32-$arch"
 
-# Note on detection sources we deliberately skip on Windows:
-#   - `~/.local/share/claude/versions` and `%LOCALAPPDATA%\Programs\claude-code`
-#     are the Linux/Mac convention (and where Anthropic *used to* drop the
-#     Windows binary). On modern Windows they're stale: once a binary lands
-#     there it never gets refreshed, because we patch out `claude update` to
-#     stop it from breaking the Bun runtime under our launcher. Detection
-#     happily picked the original ~half-year-old binary forever.
-#   - `claude.orig.exe` backups are a frozen snapshot from initial install,
-#     same problem — they exist solely for `--uninstall` to restore vanilla
-#     Claude, never as an install source.
-# What's left below — npm-global, bun-global, and the npm-registry
-# fallback — all route to whatever's actually current at install time.
+# Detection policy: ALWAYS pull from the npm registry @latest.
+#
+# Earlier versions of this script also probed local install directories
+# (versions/, claude.orig, npm-global, bun-global) before falling back to
+# the registry. Every one of those is a stale-source trap: clawgod patches
+# out `claude update`, so users never re-run the underlying installers,
+# and those directories freeze at whatever version was on disk the day
+# clawgod was first installed. `claude update` (which is now redirected
+# here) would re-detect the frozen binary forever — never reaching the
+# registry. See INCIDENT_LOG 2026-04-29 entry. The fix is to skip local
+# detection entirely; the npm tarball is ~60-90 MB compressed, fetched
+# once per upgrade.
 
-# 1. npm global install. The postinstall hook copies the platform binary to
-#    <npm root -g>\@anthropic-ai\claude-code\bin\claude.exe (the file name
-#    stays as .exe on every platform — that's how the npm wrapper is built).
-if (-not $NativeBin) {
-    try {
-        $npmRoot = (& npm root -g 2>$null | Out-String).Trim()
-        if ($npmRoot -and (Test-Path $npmRoot)) {
-            $candList = @(
-                (Join-Path $npmRoot "@anthropic-ai\claude-code\bin\claude.exe"),
-                (Join-Path $npmRoot "@anthropic-ai\claude-code-$platformSuffix\claude.exe")
-            )
-            foreach ($c in $candList) {
-                if ((Test-Path $c) -and (Get-Item $c).Length -gt 10MB) {
-                    $NativeBin = $c
-                    # Read upstream version for stamp
-                    $pkgJson = Join-Path $npmRoot "@anthropic-ai\claude-code\package.json"
-                    if (Test-Path $pkgJson) {
-                        try {
-                            $NativeBinLabel = (Get-Content $pkgJson -Raw | ConvertFrom-Json).version
-                        } catch { $NativeBinLabel = "npm-global" }
-                    } else {
-                        $NativeBinLabel = "npm-global"
-                    }
-                    break
-                }
-            }
-        }
-    } catch {}
-}
-
-# 4. bun global install
-if (-not $NativeBin) {
-    $bunGlobalRoot = Join-Path $env:USERPROFILE ".bun\install\global\node_modules"
-    if (Test-Path $bunGlobalRoot) {
-        $candList = @(
-            (Join-Path $bunGlobalRoot "@anthropic-ai\claude-code\bin\claude.exe"),
-            (Join-Path $bunGlobalRoot "@anthropic-ai\claude-code-$platformSuffix\claude.exe")
-        )
-        foreach ($c in $candList) {
-            if ((Test-Path $c) -and (Get-Item $c).Length -gt 10MB) {
-                $NativeBin = $c
-                $pkgJson = Join-Path $bunGlobalRoot "@anthropic-ai\claude-code\package.json"
-                if (Test-Path $pkgJson) {
-                    try {
-                        $NativeBinLabel = (Get-Content $pkgJson -Raw | ConvertFrom-Json).version
-                    } catch { $NativeBinLabel = "bun-global" }
-                } else {
-                    $NativeBinLabel = "bun-global"
-                }
-                break
-            }
-        }
-    }
-}
-
-# 5. npm registry fallback — pull the platform tarball directly via Node.
+# npm registry — pull the platform tarball directly via Node.
 #    Avoids depending on `npm` and `tar` being on PATH (older Windows 10
 #    builds lack tar.exe; some PowerShell shims mangle `& npm`). Node is
 #    already a hard prerequisite for the patcher, so reuse it.
 if (-not $NativeBin) {
     $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
-    Write-Dim "No local Claude Code binary found, fetching $npmPkg from npm registry ..."
+    Write-Dim "Fetching $npmPkg@latest from npm registry ..."
     $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $NativeBinTmpDir | Out-Null
     $fetchScript = Join-Path $NativeBinTmpDir "fetch.mjs"

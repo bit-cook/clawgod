@@ -125,12 +125,8 @@ info "ripgrep: $(rg --version | head -1)"
 # ─── Locate native Bun binary (cli.js source) ──────────────────────────
 # v2.1.113+ ships a Bun standalone executable as the only canonical form.
 # We extract cli.js text from this binary, patch it, then run via Bun
-# runtime. Sources, in priority order:
-#  1. Existing official install:  ~/.local/share/claude/versions/<v>
-#  2. Prior clawgod backup:        $BIN_DIR/claude.orig (symlink or file)
-#  3. npm registry fallback:       @anthropic-ai/claude-code-<platform>
-# This means users can install ClawGod without having to run the official
-# Claude Code installer first — npm gives us the same binary either way.
+# runtime. Source: npm registry (@anthropic-ai/claude-code-<platform>).
+# Local binary detection is intentionally skipped — see policy note below.
 
 mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
 
@@ -138,20 +134,20 @@ NATIVE_BIN=""
 NATIVE_BIN_LABEL=""
 NATIVE_BIN_TMPDIR=""
 
-# Note on detection sources we deliberately skip:
-#   - `~/.local/share/claude/versions/`: Anthropic's official install drops
-#     the binary here on first run, but the directory only ever grows —
-#     since we patch out `claude update` (it would otherwise overwrite the
-#     bun runtime under our launcher), nothing refreshes it. Self-update via
-#     our `claude update` redirect should always pull the *current* upstream
-#     release, not whatever was downloaded the day clawgod was first set up.
-#   - Backup binaries (`claude.orig`): a frozen snapshot from initial install,
-#     same problem. Backups exist solely for `--uninstall` to restore vanilla
-#     Claude, never as an install source.
-# What's left below — npm-global, bun-global, and the npm-registry
-# fallback — all route to whatever's actually current at install time.
+# Detection policy: ALWAYS pull from the npm registry @latest.
+#
+# Earlier versions of this script also probed local `node_modules` roots
+# (npm-global, bun-global) before falling back to the registry. That was
+# a stale-source trap: once clawgod is installed it patches out
+# `claude update`, so users never re-run `npm install -g` / `bun add -g`.
+# Both directories freeze at whatever version was on disk the day clawgod
+# was first installed, and `claude update` (which is now redirected here)
+# would re-detect that frozen binary forever — never reaching the
+# registry. See INCIDENT_LOG 2026-04-29 entry. The fix is to skip local
+# detection entirely; the npm tarball is ~60-90 MB compressed, fetched
+# once per upgrade, and npm's HTTP cache keeps repeats fast.
 
-# Detect platform suffix (also used by the npm fallback below)
+# Detect platform suffix (used by the npm fetch below)
 case "$(uname -s)" in
   Darwin) os="darwin" ;;
   Linux)  os="linux" ;;
@@ -168,52 +164,9 @@ else
   PLATFORM="${os}-${arch}"
 fi
 
-# Helper: scan a node_modules root for the npm-globally-installed binary.
-# Two layouts to consider:
-#  - <root>/@anthropic-ai/claude-code/bin/claude.exe — the wrapper package's
-#    postinstall always copies the platform binary to this path; the .exe
-#    suffix is upstream's choice and is kept on every OS.
-#  - <root>/@anthropic-ai/claude-code-<platform>/claude — the platform
-#    package's own binary, used directly when the wrapper postinstall was
-#    skipped (e.g. --omit=optional).
-scan_node_modules_root() {
-  local root="$1" tag="$2" cand sz
-  [ -d "$root" ] || return 1
-  for cand in \
-      "$root/@anthropic-ai/claude-code/bin/claude.exe" \
-      "$root/@anthropic-ai/claude-code-${PLATFORM}/claude"; do
-    [ -f "$cand" ] || continue
-    sz=$(stat -f%z "$cand" 2>/dev/null || stat -c%s "$cand" 2>/dev/null || echo 0)
-    [ "$sz" -gt 10000000 ] || continue
-    NATIVE_BIN="$cand"
-    if [ -f "$root/@anthropic-ai/claude-code/package.json" ]; then
-      NATIVE_BIN_LABEL=$(node -e "console.log(require('$root/@anthropic-ai/claude-code/package.json').version)" 2>/dev/null || echo "$tag")
-    else
-      NATIVE_BIN_LABEL="$tag"
-    fi
-    return 0
-  done
-  return 1
-}
-
-# Fallback: existing npm `-g` install
-# `|| true` because scan_node_modules_root returns 1 on a clean miss, and
-# under `set -e` the trailing && or the last command of a then-block would
-# turn that into a fatal exit — preventing us from ever reaching the npm
-# registry fallback below.
-if [ -z "$NATIVE_BIN" ] && command -v npm &>/dev/null; then
-  NPM_GLOBAL=$(npm root -g 2>/dev/null)
-  [ -n "$NPM_GLOBAL" ] && scan_node_modules_root "$NPM_GLOBAL" "npm-global" || true
-fi
-
-# Fallback: existing bun `add -g` install
-if [ -z "$NATIVE_BIN" ]; then
-  scan_node_modules_root "$HOME/.bun/install/global/node_modules" "bun-global" || true
-fi
-
-# Last-resort fallback: pull the Bun standalone binary from the npm registry.
-# Anthropic publishes per-platform packages (e.g. claude-code-darwin-arm64);
-# their tarball ships the binary directly under package/.
+# Pull the Bun standalone binary from the npm registry. Anthropic publishes
+# per-platform packages (e.g. claude-code-darwin-arm64); their tarball ships
+# the binary directly under package/.
 if [ -z "$NATIVE_BIN" ]; then
   if ! command -v npm &>/dev/null; then
     warn "No native Claude Code binary found locally, and npm is not installed."
@@ -227,7 +180,7 @@ if [ -z "$NATIVE_BIN" ]; then
     exit 1
   fi
   NPM_PKG="@anthropic-ai/claude-code-${PLATFORM}"
-  dim "No local Claude Code binary found, fetching $NPM_PKG from npm ..."
+  dim "Fetching $NPM_PKG@latest from npm registry ..."
   NATIVE_BIN_TMPDIR=$(mktemp -d)
   if ( cd "$NATIVE_BIN_TMPDIR" && npm pack "$NPM_PKG@latest" --silent >/dev/null 2>&1 ); then
     TARBALL=$(ls "$NATIVE_BIN_TMPDIR"/*.tgz 2>/dev/null | head -1)
