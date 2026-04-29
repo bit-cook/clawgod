@@ -1108,8 +1108,10 @@ const patches = [
   },
   {
     name: 'Remove cautious actions section',
-    pattern: /function ([\w$]+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
-    replacer: (m, fn) => `function ${fn}(){return\`\`}`,
+    // v2.1.88-~v2.1.122: function GSY(){return`# Executing actions...`}
+    // v2.1.123+: function _j3(H){if(LE8(H)==="compact")return`# Executing...short`;return`# Executing...long`}
+    pattern: /function ([\w$]+)\(([\w$]*)\)\{(?:if\([\s\S]{1,200}?\)return`# Executing actions with care\n\n[\s\S]*?`;)?return`# Executing actions with care\n\n[\s\S]*?`\}/g,
+    replacer: (m, fn, arg) => `function ${fn}(${arg}){return\`\`}`,
     sentinel: '# Executing actions with care',
   },
   {
