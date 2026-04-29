@@ -858,12 +858,11 @@ Write-OK "Re-patch helper installed (repatch.mjs)"
 
 @'
 #!/usr/bin/env bun
-const { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, statSync } = require('fs');
+const { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, statSync, renameSync } = require('fs');
 const { join, basename } = require('path');
 const { homedir } = require('os');
 const { spawnSync } = require('child_process');
 
-const claudeDir = join(homedir(), '.claude');
 const clawgodDir = join(homedir(), '.clawgod');
 
 // Note: drift detection removed — see install.sh wrapper for full notes.
@@ -871,7 +870,17 @@ const clawgodDir = join(homedir(), '.clawgod');
 // clawgod installs (we patch out `claude update`), so the check could only
 // retract a fresh install.ps1 / install.sh upgrade. `claude update` →
 // install.sh redirect is the single source of truth for version upgrades.
-const configDir = process.env.CLAUDE_CONFIG_DIR || (existsSync(claudeDir) ? claudeDir : clawgodDir);
+
+// One-time migration: earlier wrapper versions set CLAUDE_CONFIG_DIR=~/.clawgod,
+// which made Claude Code read/write ~/.clawgod/.claude.json instead of the
+// native ~/.claude.json (the file holding MCP config, project history, session
+// index). Move it back transparently on first run after upgrade.
+const nativeClaudeJson = join(homedir(), '.claude.json');
+const strayClaudeJson = join(clawgodDir, '.claude.json');
+if (existsSync(strayClaudeJson) && !existsSync(nativeClaudeJson)) {
+  try { renameSync(strayClaudeJson, nativeClaudeJson); } catch {}
+}
+
 const providerDir = clawgodDir;
 const configFile = join(providerDir, 'provider.json');
 
@@ -901,15 +910,11 @@ if (hasProviderApiKey) {
   if (config.baseURL) process.env.ANTHROPIC_BASE_URL = config.baseURL;
   if (config.model) process.env.ANTHROPIC_MODEL = config.model;
   if (config.smallModel) process.env.ANTHROPIC_SMALL_FAST_MODEL = config.smallModel;
-  process.env.CLAUDE_CONFIG_DIR = clawgodDir;
   if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
     process.env.ANTHROPIC_AUTH_TOKEN ??= config.apiKey;
   }
-} else {
-  if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
-    process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
-  }
-  process.env.CLAUDE_CONFIG_DIR ??= configDir;
+} else if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
+  process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
 }
 
 if (config.timeoutMs) {
