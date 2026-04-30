@@ -1206,6 +1206,7 @@ if ($sanityOut -match "Expected CommonJS module to have a function wrapper") {
     Write-Err ""
     Write-Err "  If your bun is from bun.sh:"
     Write-Err "    bun upgrade --canary"
+    Write-Err "    or: powershell -c ""iex & {`$(irm https://bun.sh/install.ps1)} -Version canary"""
     Write-Err ""
     Write-Err "  If your bun is from scoop (the binary is behind a shim and refuses to"
     Write-Err "  self-replace, so 'bun upgrade' silently hangs):"
