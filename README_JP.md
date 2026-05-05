@@ -158,3 +158,7 @@ irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 -Out
 ## ライセンス
 
 GPL-3.0 — Anthropic とは無関係です。自己責任でご使用ください。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=0Chencc/clawgod&type=date&legend=top-left)](https://www.star-history.com/?repos=0Chencc%2Fclawgod&type=date&legend=top-left)
