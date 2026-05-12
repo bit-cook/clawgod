@@ -1286,12 +1286,16 @@ Write-OK "Bun loads cli.original.cjs"
 # Chinese/Korean/Japanese usernames). cmd.exe resolves %USERPROFILE% at
 # runtime so no problematic characters need to be baked into the .cmd file.
 $cliPathInCmd = "%USERPROFILE%\.clawgod\cli.cjs"
-if ($BunBin.StartsWith($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase)) {
-    $bunRelative = $BunBin.Substring($env:USERPROFILE.Length).TrimStart('\', '/')
+$normalizedUserProfile = $env:USERPROFILE.TrimEnd('\', '/')
+$normalizedBunBin = $BunBin.TrimEnd('\', '/')
+$userProfilePrefix = "$normalizedUserProfile\"
+if ($normalizedBunBin.Equals($normalizedUserProfile, [StringComparison]::OrdinalIgnoreCase) -or
+    $normalizedBunBin.StartsWith($userProfilePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $bunRelative = $normalizedBunBin.Substring($normalizedUserProfile.Length).TrimStart('\', '/')
     $bunPathInCmd = "%USERPROFILE%\$bunRelative"
 } else {
-    # Bun outside USERPROFILE (e.g. system-wide install) — absolute path,
-    # which is fine because system paths don't contain non-ASCII characters.
+    # Bun outside USERPROFILE (e.g. system-wide install) — fall back to
+    # absolute path since %USERPROFILE%-relative expansion doesn't apply.
     $bunPathInCmd = $BunBin
 }
 $launcherContent = "@echo off`r`n`"$bunPathInCmd`" `"$cliPathInCmd`" %*"
