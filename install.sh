@@ -869,6 +869,18 @@ if (hasProviderApiKey) {
   process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
 }
 
+// Third-party Anthropic-compatible proxies (DeepSeek / OneAPI / Bedrock /
+// vLLM / etc.) don't share Anthropic's server-side handling of
+// x-anthropic-billing-header. That header carries a per-request `cch` field
+// which Anthropic's own server excludes from prompt-cache key calculation
+// (via cacheScope:null), but third-party proxies fold into the prefix hash —
+// so the cached prefix changes every request and cache hit rate drops to
+// zero. Auto-disable the header whenever baseURL points away from Anthropic.
+// Users can force re-enable with CLAUDE_CODE_ATTRIBUTION_HEADER=1 if needed.
+if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
+  process.env.CLAUDE_CODE_ATTRIBUTION_HEADER ??= '0';
+}
+
 if (config.timeoutMs) {
   process.env.API_TIMEOUT_MS ??= String(config.timeoutMs);
 }

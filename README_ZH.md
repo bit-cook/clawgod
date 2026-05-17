@@ -74,6 +74,7 @@ irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 | ie
 | 功能 | 作用 |
 |------|------|
 | **1h Prompt Cache** | 强制启用 1h TTL allowlist（默认实际是 5m → 空闲后导致大量 cache_creation token 浪费） |
+| **第三方 Cache 修复** | 当 `baseURL` 指向非 Anthropic 域名时自动关闭 `x-anthropic-billing-header`。该 header 里的 `cch` 字段每请求都变，会让 DeepSeek / OneAPI / Bedrock / vLLM 以及所有 Anthropic 协议代理的 prompt-cache 命中率归零。不需要再自行配置 `CLAUDE_CODE_ATTRIBUTION_HEADER=0`。 |
 | **自动重打补丁** | 检测到用户官方升级了 native Claude binary 时，下次启动自动重新抽取 + 重新 patch |
 
 ## 使用

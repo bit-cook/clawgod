@@ -74,6 +74,7 @@ Green logo = patched. Orange logo = original.
 | Feature | What it does |
 |---------|-------------|
 | **1h Prompt Cache** | Forces 1h TTL allowlist on (was effectively 5m → much higher cache_creation token usage) |
+| **Third-Party Cache Fix** | Auto-disables `x-anthropic-billing-header` when `baseURL` is non-Anthropic. The header's per-request `cch` field breaks prompt-cache hit rate on DeepSeek / OneAPI / Bedrock / vLLM and any other Anthropic-compatible proxy. You no longer need to set `CLAUDE_CODE_ATTRIBUTION_HEADER=0` yourself. |
 | **Auto Re-patch** | Detects when the user's native Claude binary has been upgraded; transparently re-extracts and re-patches on next launch |
 
 ## Commands
